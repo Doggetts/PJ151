@@ -1,0 +1,1326 @@
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 1   
+
+
+C51 COMPILER V9.60.0.0, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN .\Objects\main.obj
+COMPILER INVOKED BY: C:\Keil_c51\C51\BIN\C51.EXE main.c LARGE OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND PRINT(.\Listin
+                    -gs\main.lst) TABS(2) OBJECT(.\Objects\main.obj)
+
+line level    source
+
+   1          #include "main.h"
+   2          
+   3          unsigned char datt[] = "RUN!\r\n";     //上电串口提示信息
+   4          SYS_DATA_TYPE_STRUCT Sys;              //系统全局变量
+   5          COMx_Define COM1;                      //串口1通信变量
+   6          
+   7          //========================================================================
+   8          //                            硬件引脚定义
+   9          //========================================================================
+  10          #define PWM_LED  P15                   //白光LED控制 PWM CH3
+  11          #define PWM_G    P11                   //绿光LED控制 PWM CH2
+  12          #define PWM_R    P13                   //红光LED控制 PWM CH1
+  13          #define LD_EN    P16                   //激光器控制 低电平开(硬件反相)
+  14          #define V5_EN    P17                   //5V升压使能 高电平开
+  15          #define TEMP     P10                   //NTC温度检测 ADC
+  16          #define USART_RX P30                   //串口接收
+  17          #define USART_TX P31                   //串口发送
+  18          #define KEY_RED    P37                 //红键  0:按下 1:松开
+  19          #define KEY_GREEN  P36                 //绿键  0:按下 1:松开
+  20          #define KEY_WEAK   P35                 //弱键  0:按下 1:松开
+  21          #define KEY_LEFT   P34                 //左档  0:按下 1:松开
+  22          #define KEY_MID    P32                 //中档  0:按下 1:松开
+  23          #define KEY_RIGHT  P33                 //右档  0:按下 1:松开
+  24          
+  25          //========================================================================
+  26          //                            按键扫描结构体
+  27          //========================================================================
+  28          typedef struct
+  29          {
+  30            unsigned char stable;              //消抖后稳定电平 0:按下 1:松开
+  31            unsigned char pressed;             //当前是否处于按下状态
+  32            unsigned int  debounce_ms;         //消抖累计时间
+  33            unsigned int  hold_ms;             //本次按下持续时间
+  34            unsigned char click_cnt;           //连击计数
+  35            unsigned int  click_wait_ms;       //等待双击超时计数
+  36            unsigned char long1_done;          //长按1s已触发标志
+  37            unsigned char long10_done;         //长按10s已触发标志
+  38            unsigned char dbl_wait;            //等待双击第二下标志
+  39            unsigned char dbl_hold_arm;        //双击按住模式已激活
+  40            unsigned int  second_hold_ms;      //双击第二下按住时间
+  41          } KEY_SCAN_TYPE;
+  42          
+  43          static KEY_SCAN_TYPE KeyRed, KeyGreen, KeyWeak;  //三颗功能键扫描状态
+  44          
+  45          //========================================================================
+  46          // 函数: Key_Read
+  47          // 描述: 读取按键逻辑电平(高电平=松开).
+  48          // 参数: pin - 引脚电平.
+  49          // 返回: 1松开 0按下.
+  50          //========================================================================
+  51          static unsigned char Key_Read(unsigned char pin)
+  52          {
+  53   1        return pin ? 1 : 0;
+  54   1      }
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 2   
+
+  55          
+  56          //========================================================================
+  57          // 函数: Gear_Get
+  58          // 描述: 读取当前档位(优先级:中>右>左, 中档引脚有效时一律为中档).
+  59          // 参数: None.
+  60          // 返回: 档位编号 GEAR_xxx.
+  61          //========================================================================
+  62          static unsigned char Gear_Get(void)
+  63          {
+  64   1        if(!Key_Read(KEY_MID))   return GEAR_MID;
+  65   1        if(!Key_Read(KEY_RIGHT)) return GEAR_RIGHT;
+  66   1        if(!Key_Read(KEY_LEFT))  return GEAR_LEFT;
+  67   1        return GEAR_NONE;
+  68   1      }
+  69          
+  70          //========================================================================
+  71          // 函数: Output_AllOff
+  72          // 描述: 关闭所有光源输出并复位模式.
+  73          // 参数: None.
+  74          // 返回: None.
+  75          //========================================================================
+  76          void Output_AllOff(void)
+  77          {
+  78   1        Sys.Out_White = 0;
+  79   1        Sys.Out_Green = 0;
+  80   1        Sys.Out_Red = 0;
+  81   1        Sys.Out_Laser = 0;
+  82   1        Sys.Strobe_On = 0;
+  83   1        Sys.Moment_Active = 0;
+  84   1        Sys.Light_Mode = MODE_OFF;
+  85   1      }
+  86          
+  87          //========================================================================
+  88          // 函数: Status_Report
+  89          // 描述: 主动上报完整状态(同<>A5查询回复).
+  90          // 参数: None.
+  91          // 返回: None.
+  92          //========================================================================
+  93          void Status_Report(void)
+  94          {
+  95   1        printf("Sta=%bu,%bu,%bu,%bu,%bu,%bu,%bu\r\n",
+  96   1          Sys.Light_Mode, Sys.Gear, Sys.V5_On,
+  97   1          Sys.Out_White, Sys.Out_Green, Sys.Out_Red, Sys.Out_Laser);
+  98   1      }
+  99          
+ 100          static void Status_PollReport(void)
+ 101          {
+ 102   1        static unsigned char last_mode = 0xFF;
+ 103   1        static unsigned char last_gear = 0xFF;
+ 104   1        static unsigned char last_white = 0xFF;
+ 105   1        static unsigned char last_green = 0xFF;
+ 106   1        static unsigned char last_red = 0xFF;
+ 107   1        static unsigned char last_laser = 0xFF;
+ 108   1      
+ 109   1        if(last_mode != Sys.Light_Mode ||
+ 110   1          last_gear != Sys.Gear ||
+ 111   1          last_white != Sys.Out_White ||
+ 112   1          last_green != Sys.Out_Green ||
+ 113   1          last_red != Sys.Out_Red ||
+ 114   1          last_laser != Sys.Out_Laser)
+ 115   1        {
+ 116   2          last_mode = Sys.Light_Mode;
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 3   
+
+ 117   2          last_gear = Sys.Gear;
+ 118   2          last_white = Sys.Out_White;
+ 119   2          last_green = Sys.Out_Green;
+ 120   2          last_red = Sys.Out_Red;
+ 121   2          last_laser = Sys.Out_Laser;
+ 122   2          Status_Report();
+ 123   2        }
+ 124   1      }
+ 125          
+ 126          //========================================================================
+ 127          // 函数: Battery_Check
+ 128          // 描述: 电池电压检测, <3V串口报警.
+ 129          // 参数: None.
+ 130          // 返回: None.
+ 131          //========================================================================
+ 132          static void Battery_Check(void)
+ 133          {
+ 134   1        static unsigned char alarm_cnt = 0;
+ 135   1        float v = Sys.Vref_Voltage;
+ 136   1      
+ 137   1        if(v < BAT_VOLT_ALARM)
+ 138   1        {
+ 139   2          if(++alarm_cnt >= BAT_VOLT_DEBOUNCE)
+ 140   2          {
+ 141   3            if(!Sys.Bat_Alarm)
+ 142   3            {
+ 143   4              Sys.Bat_Alarm = 1;
+ 144   4              printf("Alarm=LowVolt\r\n");
+ 145   4            }
+ 146   3          }
+ 147   2        }
+ 148   1        else
+ 149   1        {
+ 150   2          alarm_cnt = 0;
+ 151   2          if(v > BAT_VOLT_ALARM_CLR)
+ 152   2            Sys.Bat_Alarm = 0;
+ 153   2        }
+ 154   1      }
+ 155          
+ 156          //========================================================================
+ 157          // 函数: Mode_StartBlocked
+ 158          // 描述: 当前无出光时, 电池电压过低则禁止新开启模式.
+ 159          // 参数: None.
+ 160          // 返回: 1禁止开启 0允许.
+ 161          //========================================================================
+ 162          static unsigned char Mode_StartBlocked(void)
+ 163          {
+ 164   1        if(Sys.Light_Mode != MODE_OFF)
+ 165   1          return 0;
+ 166   1        if(Sys.Out_Laser || Sys.Out_White || Sys.Out_Green || Sys.Out_Red)
+ 167   1          return 0;
+ 168   1        if(Sys.Vref_Voltage < BAT_VOLT_MODE_BLOCK)
+ 169   1          return 1;
+ 170   1        return 0;
+ 171   1      }
+ 172          
+ 173          //========================================================================
+ 174          // 函数: Mode_Set
+ 175          // 描述: 切换到指定常亮模式.
+ 176          // 参数: mode - 出光模式编号.
+ 177          // 返回: None.
+ 178          //========================================================================
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 4   
+
+ 179          void Mode_Set(unsigned char mode)
+ 180          {
+ 181   1        if(mode != MODE_OFF && Mode_StartBlocked())
+ 182   1          return;
+ 183   1      
+ 184   1        Output_AllOff();
+ 185   1        Sys.Light_Mode = mode;
+ 186   1      
+ 187   1        switch(mode)
+ 188   1        {
+ 189   2          case MODE_LASER_HOLD:           //激光常亮
+ 190   2            Sys.Out_Laser = 1;
+ 191   2            break;
+ 192   2          case MODE_LASER_WHITE_HOLD:     //激光+白光常亮
+ 193   2            Sys.Out_Laser = 1;
+ 194   2            Sys.Out_White = 1;
+ 195   2            break;
+ 196   2          case MODE_WHITE_HOLD:           //白光常亮
+ 197   2            Sys.Out_White = 1;
+ 198   2            break;
+ 199   2          case MODE_WHITE_STROBE_HOLD:    //白光8Hz眩目常亮
+ 200   2            Sys.Out_White = 1;
+ 201   2            Sys.Strobe_On = 1;
+ 202   2            break;
+ 203   2          case MODE_WHITE_DIM_HOLD:       //弱白光常亮
+ 204   2            Sys.Out_White = 2;
+ 205   2            break;
+ 206   2          case MODE_RED_HOLD:             //红光常亮
+ 207   2            Sys.Out_Red = 1;
+ 208   2            break;
+ 209   2          case MODE_GREEN_HOLD:           //绿光常亮
+ 210   2            Sys.Out_Green = 1;
+ 211   2            break;
+ 212   2          default:
+ 213   2            break;
+ 214   2        }
+ 215   1      }
+ 216          
+ 217          //========================================================================
+ 218          // 函数: Mode_Toggle
+ 219          // 描述: 常亮模式切换(同模式再触发则关闭).
+ 220          // 参数: mode - 出光模式编号.
+ 221          // 返回: None.
+ 222          //========================================================================
+ 223          static void Mode_Toggle(unsigned char mode)
+ 224          {
+ 225   1        if(Sys.Light_Mode == mode)
+ 226   1          Output_AllOff();
+ 227   1        else
+ 228   1          Mode_Set(mode);
+ 229   1      }
+ 230          
+ 231          //========================================================================
+ 232          // 函数: Output_Apply
+ 233          // 描述: 根据系统变量刷新硬件输出(PWM/激光/5V使能).
+ 234          // 参数: None.
+ 235          // 返回: None.
+ 236          //========================================================================
+ 237          void Output_Apply(void)
+ 238          {
+ 239   1        unsigned char white_on = 0;
+ 240   1        unsigned char white_dim = 0;
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 5   
+
+ 241   1      
+ 242   1        /* 白光输出处理(含8Hz爆闪) */
+ 243   1        if(Sys.Out_White == 1)
+ 244   1        {
+ 245   2          if(Sys.Strobe_On)
+ 246   2            white_on = Sys.Strobe_Phase;
+ 247   2          else
+ 248   2            white_on = 1;
+ 249   2        }
+ 250   1        else if(Sys.Out_White == 2)
+ 251   1        {
+ 252   2          if(Sys.Strobe_On)
+ 253   2            white_dim = Sys.Strobe_Phase;
+ 254   2          else
+ 255   2            white_dim = 1;
+ 256   2        }
+ 257   1      
+ 258   1        /* 有任意光源输出时开启5V升压 */
+ 259   1        if(Sys.Out_Laser || Sys.Out_White || Sys.Out_Green || Sys.Out_Red)
+ 260   1        {
+ 261   2          V5_EN = 1;
+ 262   2          Sys.V5_On = 1;
+ 263   2        }
+ 264   1        else
+ 265   1        {
+ 266   2          V5_EN = 0;
+ 267   2          Sys.V5_On = 0;
+ 268   2        }
+ 269   1      
+ 270   1        LD_EN = Sys.Out_Laser ? 0 : 1;      //低电平开启激光
+ 271   1      
+ 272   1        /* PWM占空比输出 */
+ 273   1        if(white_on)
+ 274   1          PWM_SetWhite(PWM_DUTY_FULL);
+ 275   1        else if(white_dim)
+ 276   1          PWM_SetWhite(PWM_DUTY_DIM);
+ 277   1        else
+ 278   1          PWM_SetWhite(0);
+ 279   1      
+ 280   1        if(Sys.Out_Green)
+ 281   1          PWM_SetGreen(PWM_DUTY_FULL);
+ 282   1        else
+ 283   1          PWM_SetGreen(0);
+ 284   1      
+ 285   1        if(Sys.Out_Red)
+ 286   1          PWM_SetRed(PWM_DUTY_FULL);
+ 287   1        else
+ 288   1          PWM_SetRed(0);
+ 289   1      }
+ 290          
+ 291          //========================================================================
+ 292          // 函数: App_Drive_Task
+ 293          // 描述: 输出驱动任务,周期20ms.
+ 294          // 参数: None.
+ 295          // 返回: None.
+ 296          //========================================================================
+ 297          void App_Drive_Task(void)
+ 298          {
+ 299   1        Output_Apply();
+ 300   1        Status_PollReport();
+ 301   1      }
+ 302          
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 6   
+
+ 303          //========================================================================
+ 304          // 函数: Key_Reset
+ 305          // 描述: 复位单颗按键的扫描状态机.
+ 306          // 参数: k - 按键扫描结构体指针.
+ 307          // 返回: None.
+ 308          //========================================================================
+ 309          static void Key_Reset(KEY_SCAN_TYPE *k)
+ 310          {
+ 311   1        k->hold_ms = 0;
+ 312   1        k->click_cnt = 0;
+ 313   1        k->click_wait_ms = 0;
+ 314   1        k->long1_done = 0;
+ 315   1        k->long10_done = 0;
+ 316   1        k->dbl_wait = 0;
+ 317   1        k->dbl_hold_arm = 0;
+ 318   1        k->second_hold_ms = 0;
+ 319   1        k->pressed = 0;
+ 320   1      }
+ 321          
+ 322          //========================================================================
+ 323          // 函数: Key_OnLong1
+ 324          // 描述: 长按1s触发(右档激光/白光瞬亮).
+ 325          // 参数: k - 按键状态; gear - 档位; key_id - 1红2绿3弱.
+ 326          // 返回: None.
+ 327          //========================================================================
+ 328          static void Key_OnLong1(KEY_SCAN_TYPE *k, unsigned char gear, unsigned char key_id)
+ 329          {
+ 330   1        if(k->long1_done) return;
+ 331   1        if(Mode_StartBlocked()) return;
+ 332   1        k->long1_done = 1;
+ 333   1        k->click_cnt = 0;
+ 334   1        k->click_wait_ms = 0;
+ 335   1        k->dbl_wait = 0;
+ 336   1      
+ 337   1        if(gear == GEAR_RIGHT)
+ 338   1        {
+ 339   2          if(key_id == 2)                 //右档+绿键 激光瞬亮
+ 340   2          {
+ 341   3            Sys.Light_Mode = MODE_LASER_MOMENT;
+ 342   3            Sys.Out_Laser = 1;
+ 343   3            Sys.Moment_Active = 1;
+ 344   3          }
+ 345   2          else if(key_id == 1)            //右档+红键 白光瞬亮
+ 346   2          {
+ 347   3            Sys.Light_Mode = MODE_WHITE_MOMENT;
+ 348   3            Sys.Out_White = 1;
+ 349   3            Sys.Moment_Active = 1;
+ 350   3          }
+ 351   2        }
+ 352   1      }
+ 353          
+ 354          //========================================================================
+ 355          // 函数: Key_OnLong10
+ 356          // 描述: 长按10s触发(左档红/绿光常亮锁定).
+ 357          // 参数: k - 按键状态; gear - 档位; key_id - 1红2绿3弱.
+ 358          // 返回: None.
+ 359          //========================================================================
+ 360          static void Key_OnLong10(KEY_SCAN_TYPE *k, unsigned char gear, unsigned char key_id)
+ 361          {
+ 362   1        if(k->long10_done) return;
+ 363   1        k->long10_done = 1;
+ 364   1        k->click_cnt = 0;
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 7   
+
+ 365   1        k->click_wait_ms = 0;
+ 366   1      
+ 367   1        if(gear == GEAR_LEFT)
+ 368   1        {
+ 369   2          if(key_id == 1)                 //左档+红键 红光常亮
+ 370   2            Mode_Set(MODE_RED_HOLD);
+ 371   2          else if(key_id == 2)            //左档+绿键 绿光常亮
+ 372   2            Mode_Set(MODE_GREEN_HOLD);
+ 373   2        }
+ 374   1      }
+ 375          
+ 376          //========================================================================
+ 377          // 函数: Key_OnSingleClick
+ 378          // 描述: 单击触发(各档位短按功能).
+ 379          // 参数: gear - 档位; key_id - 1红2绿3弱.
+ 380          // 返回: None.
+ 381          //========================================================================
+ 382          static void Key_OnSingleClick(unsigned char gear, unsigned char key_id)
+ 383          {
+ 384   1        if(gear == GEAR_RIGHT)
+ 385   1        {
+ 386   2          if(key_id == 2)                 //右档+绿键 激光常亮
+ 387   2          {
+ 388   3            if(Sys.Light_Mode == MODE_LASER_WHITE_HOLD)
+ 389   3              Output_AllOff();
+ 390   3            else
+ 391   3              Mode_Toggle(MODE_LASER_HOLD);
+ 392   3          }
+ 393   2          else if(key_id == 1)            //右档+红键 白光常亮
+ 394   2          {
+ 395   3            if(Sys.Light_Mode == MODE_WHITE_STROBE_HOLD)
+ 396   3              Output_AllOff();
+ 397   3            else
+ 398   3              Mode_Toggle(MODE_WHITE_HOLD);
+ 399   3          }
+ 400   2          else if(key_id == 3)            //右档+弱键 弱白光常亮
+ 401   2            Mode_Toggle(MODE_WHITE_DIM_HOLD);
+ 402   2        }
+ 403   1        else if(gear == GEAR_LEFT)
+ 404   1        {
+ 405   2          if(key_id == 3)                 //左档+弱键 弱白光常亮
+ 406   2            Mode_Toggle(MODE_WHITE_DIM_HOLD);
+ 407   2        }
+ 408   1      }
+ 409          
+ 410          //========================================================================
+ 411          // 函数: Key_OnDoubleClick
+ 412          // 描述: 双击触发(右档绿/红键组合功能).
+ 413          // 参数: gear - 档位; key_id - 1红2绿3弱.
+ 414          // 返回: None.
+ 415          //========================================================================
+ 416          static void Key_OnDoubleClick(unsigned char gear, unsigned char key_id)
+ 417          {
+ 418   1        if(gear == GEAR_RIGHT)
+ 419   1        {
+ 420   2          if(key_id == 2)                 //右档+绿键 激光+白光常亮
+ 421   2            Mode_Toggle(MODE_LASER_WHITE_HOLD);
+ 422   2          else if(key_id == 1)            //右档+红键 白光8Hz眩目常亮
+ 423   2            Mode_Toggle(MODE_WHITE_STROBE_HOLD);
+ 424   2        }
+ 425   1      }
+ 426          
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 8   
+
+ 427          //========================================================================
+ 428          // 函数: Key_OnDoubleHold
+ 429          // 描述: 双击后第二下按住触发(瞬亮模式).
+ 430          // 参数: gear - 档位; key_id - 1红2绿3弱.
+ 431          // 返回: None.
+ 432          //========================================================================
+ 433          static void Key_OnDoubleHold(unsigned char gear, unsigned char key_id)
+ 434          {
+ 435   1        if(Mode_StartBlocked()) return;
+ 436   1        Output_AllOff();
+ 437   1        if(gear == GEAR_RIGHT)
+ 438   1        {
+ 439   2          if(key_id == 2)                 //右档+绿键 激光+白光瞬亮
+ 440   2          {
+ 441   3            Sys.Light_Mode = MODE_LASER_WHITE_MOMENT;
+ 442   3            Sys.Out_Laser = 1;
+ 443   3            Sys.Out_White = 1;
+ 444   3            Sys.Moment_Active = 1;
+ 445   3          }
+ 446   2          else if(key_id == 1)            //右档+红键 白光8Hz眩目瞬亮
+ 447   2          {
+ 448   3            Sys.Light_Mode = MODE_WHITE_STROBE_MOMENT;
+ 449   3            Sys.Out_White = 1;
+ 450   3            Sys.Strobe_On = 1;
+ 451   3            Sys.Moment_Active = 1;
+ 452   3          }
+ 453   2        }
+ 454   1      }
+ 455          
+ 456          //========================================================================
+ 457          // 函数: Key_OnRelease
+ 458          // 描述: 按键松开事件处理.
+ 459          // 参数: k - 按键状态; gear - 档位; key_id - 1红2绿3弱.
+ 460          // 返回: None.
+ 461          //========================================================================
+ 462          static void Key_OnRelease(KEY_SCAN_TYPE *k, unsigned char gear, unsigned char key_id)
+ 463          {
+ 464   1        if(k->long10_done)                  //长按10s锁定后松开,保持常亮
+ 465   1        {
+ 466   2          Key_Reset(k);
+ 467   2          return;
+ 468   2        }
+ 469   1      
+ 470   1        if(k->long1_done)                   //长按1s瞬亮,松开关闭
+ 471   1        {
+ 472   2          if(Sys.Moment_Active)
+ 473   2            Output_AllOff();
+ 474   2          Key_Reset(k);
+ 475   2          return;
+ 476   2        }
+ 477   1      
+ 478   1        if(gear == GEAR_LEFT && !k->long10_done)
+ 479   1        {
+ 480   2          if(key_id == 1 && Sys.Light_Mode == MODE_RED_MOMENT)    //左档红光瞬亮松开
+ 481   2            Output_AllOff();
+ 482   2          else if(key_id == 2 && Sys.Light_Mode == MODE_GREEN_MOMENT) //左档绿光瞬亮松开
+ 483   2            Output_AllOff();
+ 484   2        }
+ 485   1      
+ 486   1        if(k->dbl_hold_arm)                 //双击按住瞬亮,松开关闭
+ 487   1        {
+ 488   2          if(Sys.Moment_Active)
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 9   
+
+ 489   2            Output_AllOff();
+ 490   2          Key_Reset(k);
+ 491   2          return;
+ 492   2        }
+ 493   1      
+ 494   1        if(k->dbl_wait)                     //双击第二下快速松开=双击常亮
+ 495   1        {
+ 496   2          k->dbl_wait = 0;
+ 497   2          if(k->second_hold_ms <= KEY_DBLHOLD_MS)
+ 498   2            Key_OnDoubleClick(gear, key_id);
+ 499   2          Key_Reset(k);
+ 500   2          return;
+ 501   2        }
+ 502   1      
+ 503   1        if(k->click_cnt == 1)
+ 504   1          k->click_wait_ms = KEY_DBLCLICK_MS;     //等待可能的双击
+ 505   1        else if(k->click_cnt >= 2)
+ 506   1        {
+ 507   2          Key_OnDoubleClick(gear, key_id);
+ 508   2          Key_Reset(k);
+ 509   2        }
+ 510   1      }
+ 511          
+ 512          //========================================================================
+ 513          // 函数: Key_Process
+ 514          // 描述: 单颗按键扫描与手势识别(消抖/单击/双击/长按).
+ 515          // 参数: k - 按键状态; raw - 原始电平; gear - 档位; key_id - 1红2绿3弱.
+ 516          // 返回: None.
+ 517          //========================================================================
+ 518          static void Key_Process(KEY_SCAN_TYPE *k, unsigned char raw, unsigned char gear, unsigned char key_id)
+ 519          {
+ 520   1        /* 电平变化消抖 */
+ 521   1        if(raw != k->stable)
+ 522   1        {
+ 523   2          k->debounce_ms += 20;
+ 524   2          if(k->debounce_ms >= KEY_DEBOUNCE_MS)
+ 525   2          {
+ 526   3            k->stable = raw;
+ 527   3            k->debounce_ms = 0;
+ 528   3      
+ 529   3            if(k->stable == 0)          //按下沿
+ 530   3            {
+ 531   4              k->pressed = 1;
+ 532   4              k->hold_ms = 0;
+ 533   4              if(k->click_wait_ms > 0 && k->click_cnt == 1)   //双击第二下
+ 534   4              {
+ 535   5                k->click_cnt = 2;
+ 536   5                k->click_wait_ms = 0;
+ 537   5                k->dbl_wait = 1;
+ 538   5                k->second_hold_ms = 0;
+ 539   5              }
+ 540   4            }
+ 541   3            else                        //松开沿
+ 542   3            {
+ 543   4              if(k->pressed)
+ 544   4              {
+ 545   5                if(!k->long1_done && !k->long10_done && !k->dbl_wait)
+ 546   5                  k->click_cnt++;
+ 547   5                Key_OnRelease(k, gear, key_id);
+ 548   5              }
+ 549   4              k->pressed = 0;
+ 550   4            }
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 10  
+
+ 551   3          }
+ 552   2        }
+ 553   1        else
+ 554   1          k->debounce_ms = 0;
+ 555   1      
+ 556   1        /* 按下保持中 */
+ 557   1        if(k->pressed && k->stable == 0)
+ 558   1        {
+ 559   2          if(k->hold_ms < 60000)
+ 560   2            k->hold_ms += 20;
+ 561   2      
+ 562   2          /* 双击第二下按住判定 */
+ 563   2          if(k->dbl_wait)
+ 564   2          {
+ 565   3            if(k->second_hold_ms < 60000)
+ 566   3              k->second_hold_ms += 20;
+ 567   3            if(k->second_hold_ms > KEY_DBLHOLD_MS)
+ 568   3            {
+ 569   4              k->dbl_hold_arm = 1;
+ 570   4              Key_OnDoubleHold(gear, key_id);
+ 571   4            }
+ 572   3          }
+ 573   2      
+ 574   2          /* 右档长按1s */
+ 575   2          if(gear == GEAR_RIGHT && (key_id == 1 || key_id == 2))
+ 576   2          {
+ 577   3            if(k->hold_ms >= KEY_LONG1_MS)
+ 578   3              Key_OnLong1(k, gear, key_id);
+ 579   3          }
+ 580   2      
+ 581   2          /* 左档红/绿键处理 */
+ 582   2          if(gear == GEAR_LEFT && (key_id == 1 || key_id == 2))
+ 583   2          {
+ 584   3            if(k->hold_ms >= KEY_LONG10_MS)         //长按10s锁定常亮
+ 585   3              Key_OnLong10(k, gear, key_id);
+ 586   3            else if(!k->long10_done)
+ 587   3            {
+ 588   4              if(key_id == 1 && Sys.Light_Mode != MODE_RED_HOLD)
+ 589   4              {
+ 590   5                if(Mode_StartBlocked()) return;
+ 591   5                Sys.Light_Mode = MODE_RED_MOMENT;
+ 592   5                Sys.Out_Red = 1;
+ 593   5                Sys.Moment_Active = 1;
+ 594   5              }
+ 595   4              else if(key_id == 2 && Sys.Light_Mode != MODE_GREEN_HOLD)
+ 596   4              {
+ 597   5                if(Mode_StartBlocked()) return;
+ 598   5                Sys.Light_Mode = MODE_GREEN_MOMENT;
+ 599   5                Sys.Out_Green = 1;
+ 600   5                Sys.Moment_Active = 1;
+ 601   5              }
+ 602   4            }
+ 603   3          }
+ 604   2        }
+ 605   1      
+ 606   1        /* 单击等待超时,判定为单次点击 */
+ 607   1        if(k->click_wait_ms > 0)
+ 608   1        {
+ 609   2          if(k->click_wait_ms > 20)
+ 610   2            k->click_wait_ms -= 20;
+ 611   2          else
+ 612   2          {
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 11  
+
+ 613   3            if(k->click_cnt == 1)
+ 614   3            {
+ 615   4              /* 左档红/绿常亮模式下短按关闭 */
+ 616   4              if(gear == GEAR_LEFT && key_id == 1 && Sys.Light_Mode == MODE_RED_HOLD)
+ 617   4                Output_AllOff();
+ 618   4              else if(gear == GEAR_LEFT && key_id == 2 && Sys.Light_Mode == MODE_GREEN_HOLD)
+ 619   4                Output_AllOff();
+ 620   4              else
+ 621   4                Key_OnSingleClick(gear, key_id);
+ 622   4            }
+ 623   3            Key_Reset(k);
+ 624   3          }
+ 625   2        }
+ 626   1      }
+ 627          
+ 628          //========================================================================
+ 629          // 函数: App_Key_Task
+ 630          // 描述: 按键处理任务,周期20ms.
+ 631          // 参数: None.
+ 632          // 返回: None.
+ 633          //========================================================================
+ 634          void App_Key_Task(void)
+ 635          {
+ 636   1        unsigned char gear;
+ 637   1        static unsigned char gear_last = 0xFF;
+ 638   1      
+ 639   1        gear = Gear_Get();
+ 640   1      
+ 641   1        /* 任意档位改变则关闭输出并复位按键状态 */
+ 642   1        if(gear != gear_last)
+ 643   1        {
+ 644   2          if(gear_last != 0xFF)
+ 645   2          {
+ 646   3            Output_AllOff();
+ 647   3            Output_Apply();
+ 648   3            Key_Reset(&KeyRed);
+ 649   3            Key_Reset(&KeyGreen);
+ 650   3            Key_Reset(&KeyWeak);
+ 651   3            Sys.MidHold_ms = 0;
+ 652   3          }
+ 653   2          gear_last = gear;
+ 654   2        }
+ 655   1        Sys.Gear = gear;
+ 656   1      
+ 657   1        if(gear == GEAR_RIGHT || gear == GEAR_LEFT)
+ 658   1        {
+ 659   2          Key_Process(&KeyRed,   Key_Read(KEY_RED),   gear, 1);
+ 660   2          Key_Process(&KeyGreen, Key_Read(KEY_GREEN), gear, 2);
+ 661   2          Key_Process(&KeyWeak,  Key_Read(KEY_WEAK),  gear, 3);
+ 662   2        }
+ 663   1        else
+ 664   1        {
+ 665   2          Key_Reset(&KeyRed);
+ 666   2          Key_Reset(&KeyGreen);
+ 667   2          Key_Reset(&KeyWeak);
+ 668   2        }
+ 669   1      
+ 670   1        /* 中档保持5s后进入休眠, P32上升沿唤醒 */
+ 671   1        if(Sys.Gear == GEAR_MID)
+ 672   1        {
+ 673   2          if(Sys.MidHold_ms < 65000)
+ 674   2            Sys.MidHold_ms += 20;
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 12  
+
+ 675   2          if(Sys.MidHold_ms >= MID_SHUTDOWN_MS)
+ 676   2          {
+ 677   3            Sys.MidHold_ms = 0;
+ 678   3            ShutDown();
+ 679   3          }
+ 680   2        }
+ 681   1        else
+ 682   1          Sys.MidHold_ms = 0;
+ 683   1      }
+ 684          
+ 685          //========================================================================
+ 686          // 函数: Usart_HandleCmd
+ 687          // 描述: 串口命令解析(帧格式: <>命令).
+ 688          // 参数: None.
+ 689          // 返回: None.
+ 690          //
+ 691          // 查询命令(C51须用%bu打印unsigned char, 否则参数栈错位):
+ 692          //   <A1> 版本号    <A2> 温度    <A3> 电池电压
+ 693          //   <A4> 当前模式  <A5> 完整状态
+ 694          // 控制命令:
+ 695          //   <M00>~<M13> 设置模式  <B0> 全关
+ 696          //   <C1=0/1> 激光  <C2=0/1> 白光强  <C3=0/1> 白光弱
+ 697          //   <C4=0/1> 绿光  <C5=0/1> 红光  <D1=0/1> 爆闪
+ 698          //   <>REBOOT 重启
+ 699          //========================================================================
+ 700          static void Usart_HandleCmd(void)
+ 701          {
+ 702   1        char *p = COM1.RX_Buffer;
+ 703   1      
+ 704   1        if(p[0] != '<' || p[1] != '>') return;
+ 705   1      
+ 706   1        /* A类: 查询命令 */
+ 707   1        if(p[2] == 'A')
+ 708   1        {
+ 709   2          if(p[3] == '1')
+ 710   2            printf("Ver=%bu.%bu\r\n", Sys.Ver_Major, Sys.Ver_Minor);
+ 711   2          else if(p[3] == '2')
+ 712   2            printf("Temp=%.1f\r\n", Sys.Board_Temp);
+ 713   2          else if(p[3] == '3')
+ 714   2            printf("Vref=%.2f\r\n", Sys.Vref_Voltage);
+ 715   2          else if(p[3] == '4')
+ 716   2            printf("Mode=%bu\r\n", Sys.Light_Mode);
+ 717   2          else if(p[3] == '5')
+ 718   2            Status_Report();
+ 719   2          return;
+ 720   2        }
+ 721   1      
+ 722   1        /* M类: 模式设置 <M00>~<M13> */
+ 723   1        if(p[2] == 'M' && p[3] >= '0' && p[3] <= '9')
+ 724   1        {
+ 725   2          unsigned char mode = (p[3] - '0');
+ 726   2          if(p[4] >= '0' && p[4] <= '9')
+ 727   2            mode = mode * 10 + (p[4] - '0');
+ 728   2          if(mode <= MODE_GREEN_HOLD)
+ 729   2          {
+ 730   3            if(mode == MODE_OFF)
+ 731   3            {
+ 732   4              Output_AllOff();
+ 733   4              printf("OK\r\n");
+ 734   4            }
+ 735   3            else if(Mode_StartBlocked())
+ 736   3              printf("ERR\r\n");
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 13  
+
+ 737   3            else
+ 738   3            {
+ 739   4              Mode_Set(mode);
+ 740   4              printf("OK\r\n");
+ 741   4            }
+ 742   3          }
+ 743   2          else
+ 744   2            printf("ERR\r\n");
+ 745   2          return;
+ 746   2        }
+ 747   1      
+ 748   1        /* B类: 全关 */
+ 749   1        if(p[2] == 'B' && p[3] == '0')
+ 750   1        {
+ 751   2          Output_AllOff();
+ 752   2          printf("OK\r\n");
+ 753   2          return;
+ 754   2        }
+ 755   1      
+ 756   1        /* C类: 独立通道控制 <Cx=0/1> */
+ 757   1        if(p[2] == 'C' && p[4] == '=' && (p[5] == '0' || p[5] == '1'))
+ 758   1        {
+ 759   2          unsigned char on = (p[5] == '1');
+ 760   2          if(on && Mode_StartBlocked())
+ 761   2          {
+ 762   3            printf("ERR\r\n");
+ 763   3            return;
+ 764   3          }
+ 765   2          if(p[3] == '1') { Sys.Out_Laser = on; Sys.Light_Mode = on ? MODE_LASER_HOLD : MODE_OFF; }
+ 766   2          else if(p[3] == '2') { Sys.Out_White = on ? 1 : 0; if(on) Sys.Light_Mode = MODE_WHITE_HOLD; }
+ 767   2          else if(p[3] == '3') { Sys.Out_White = on ? 2 : 0; if(on) Sys.Light_Mode = MODE_WHITE_DIM_HOLD; }
+ 768   2          else if(p[3] == '4') { Sys.Out_Green = on; if(on) Sys.Light_Mode = MODE_GREEN_HOLD; }
+ 769   2          else if(p[3] == '5') { Sys.Out_Red = on; if(on) Sys.Light_Mode = MODE_RED_HOLD; }
+ 770   2          else { printf("ERR\r\n"); return; }
+ 771   2          if(!on && !Sys.Out_Laser && !Sys.Out_White && !Sys.Out_Green && !Sys.Out_Red)
+ 772   2            Sys.Light_Mode = MODE_OFF;
+ 773   2          printf("OK\r\n");
+ 774   2          return;
+ 775   2        }
+ 776   1      
+ 777   1        /* D类: 爆闪控制 <D1=0/1> */
+ 778   1        if(p[2] == 'D' && p[3] == '1' && p[4] == '=' && (p[5] == '0' || p[5] == '1'))
+ 779   1        {
+ 780   2          unsigned char on = (p[5] == '1');
+ 781   2          if(on && Sys.Out_White == 0 && Mode_StartBlocked())
+ 782   2          {
+ 783   3            printf("ERR\r\n");
+ 784   3            return;
+ 785   3          }
+ 786   2          Sys.Strobe_On = on;
+ 787   2          if(Sys.Strobe_On && Sys.Out_White == 0)
+ 788   2            Sys.Out_White = 1;
+ 789   2          printf("OK\r\n");
+ 790   2          return;
+ 791   2        }
+ 792   1      
+ 793   1        /* 重启 */
+ 794   1        if(p[2] == 'R' && p[3] == 'E' && p[4] == 'B' && p[5] == 'O' && p[6] == 'O' && p[7] == 'T')
+ 795   1        {
+ 796   2          IAP_CONTR |= 0x60;
+ 797   2          return;
+ 798   2        }
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 14  
+
+ 799   1      
+ 800   1        printf("ERR\r\n");
+ 801   1      }
+ 802          
+ 803          //========================================================================
+ 804          // 函数: App_Usart_Task
+ 805          // 描述: 串口接收任务,帧超时后解析,周期16ms.
+ 806          // 参数: None.
+ 807          // 返回: None.
+ 808          //========================================================================
+ 809          void App_Usart_Task(void)
+ 810          {
+ 811   1        if(COM1.RX_TimeOut > 0)
+ 812   1        {
+ 813   2          if(--COM1.RX_TimeOut == 0)
+ 814   2          {
+ 815   3            Usart_HandleCmd();
+ 816   3            COM1.RX_Cnt = 0;
+ 817   3          }
+ 818   2        }
+ 819   1      }
+ 820          
+ 821          //========================================================================
+ 822          // 函数: App_Analysis_Task
+ 823          // 描述: ADC采集与NTC温度计算,周期500ms.
+ 824          // 参数: None.
+ 825          // 返回: None.
+ 826          //========================================================================
+ 827          void App_Analysis_Task(void)
+ 828          {
+ 829   1        unsigned int AD_Board_Temp, AD_Vref_Voltage;
+ 830   1        float T2 = 298.15;                  //参考温度25℃(K)
+ 831   1        float Ka = 273.15;
+ 832   1        float V_adc, R_ntc;
+ 833   1        int *BGV;
+ 834   1      
+ 835   1        BGV = (int idata *)0xef;
+ 836   1      
+ 837   1        AD_Vref_Voltage = ADCRead(15);
+ 838   1        AD_Board_Temp = ADCRead(0);
+ 839   1      
+ 840   1        Sys.Vref_Voltage = 1.024 * *BGV / AD_Vref_Voltage;
+ 841   1      
+ 842   1        /*
+ 843   1         * 分压电路: Vcc--[NTC]--P10(ADC)--[10K]--GND  (NTC在高端)
+ 844   1         * V_adc = Vcc * Rpull / (Rntc + Rpull)
+ 845   1         * Rntc  = Rpull * (Vcc - V_adc) / V_adc
+ 846   1         */
+ 847   1        V_adc = (float)AD_Board_Temp / ADC_FULL_SCALE * NTC_SUPPLY_V;
+ 848   1        if(V_adc < 0.01f)
+ 849   1          V_adc = 0.01f;
+ 850   1        R_ntc = NTC_R_PULL * (NTC_SUPPLY_V - V_adc) / V_adc;
+ 851   1      
+ 852   1        Sys.Board_Temp = 1.0f / (1.0f / T2 + log(R_ntc / NTC_R25) / NTC_B_VALUE) - Ka + 0.5f;
+ 853   1      
+ 854   1        /* 温度限幅 */
+ 855   1        if(Sys.Board_Temp < -40)
+ 856   1          Sys.Board_Temp = -40;
+ 857   1        else if(Sys.Board_Temp > 120)
+ 858   1          Sys.Board_Temp = 120;
+ 859   1      
+ 860   1        Battery_Check();
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 15  
+
+ 861   1      }
+ 862          
+ 863          //========================================================================
+ 864          //                            任务调度表
+ 865          //========================================================================
+ 866          static TASK_COMPONENTS Task_Comps[] =
+ 867          {
+ 868          //状态  计数  周期  函数
+ 869            {0, 20,  20,  App_Key_Task},        /* 按键处理     Period: 20ms  */
+ 870            {0, 500, 500, App_Analysis_Task},   /* 信号采集     Period: 500ms */
+ 871            {0, 20,  20,  App_Drive_Task},      /* 输出驱动     Period: 20ms  */
+ 872            {0, 16,  16,  App_Usart_Task},      /* 串口解析     Period: 16ms  */
+ 873          };
+ 874          
+ 875          unsigned char Tasks_Max = sizeof(Task_Comps) / sizeof(Task_Comps[0]);
+ 876          
+ 877          //========================================================================
+ 878          // INT0中断  中档P32唤醒后软复位开机
+ 879          //========================================================================
+ 880          void INT0_Isr() interrupt 0
+ 881          {
+ 882   1        Hw_IO_Init();
+ 883   1        IAP_CONTR |= 0x60;                  //软复位,重新从main启动
+ 884   1      }
+ 885          
+ 886          //========================================================================
+ 887          // 定时器0中断  系统时钟  每1ms中断1次
+ 888          //========================================================================
+ 889          void TM0_Isr() interrupt 1
+ 890          {
+ 891   1        Sys.Tick_ms++;
+ 892   1        /* 8Hz爆闪: 周期125ms, 半周期约63ms */
+ 893   1        if(Sys.Strobe_On)
+ 894   1        {
+ 895   2          if((Sys.Tick_ms % 63) == 0)
+ 896   2            Sys.Strobe_Phase ^= 1;
+ 897   2        }
+ 898   1        else
+ 899   1          Sys.Strobe_Phase = 1;
+ 900   1      
+ 901   1        Task_Marks_Handler_Callback();
+ 902   1      }
+ 903          
+ 904          //========================================================================
+ 905          // 串口中断
+ 906          //========================================================================
+ 907          void UartIsr() interrupt 4
+ 908          {
+ 909   1        if(TI)                              //发送完成
+ 910   1        {
+ 911   2          TI = 0;
+ 912   2          COM1.busy = 0;
+ 913   2        }
+ 914   1        if(RI)                              //接收数据
+ 915   1        {
+ 916   2          RI = 0;
+ 917   2          if(COM1.busy == 0)
+ 918   2          {
+ 919   3            if(COM1.RX_Cnt >= COM_RX_Lenth)
+ 920   3              COM1.RX_Cnt = 0;
+ 921   3            COM1.RX_Buffer[COM1.RX_Cnt++] = SBUF;
+ 922   3            COM1.RX_TimeOut = TimeOutSet1;
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 16  
+
+ 923   3          }
+ 924   2        }
+ 925   1      }
+ 926          
+ 927          //========================================================================
+ 928          // 函数: main
+ 929          // 描述: 主函数,初始化硬件并进入任务调度循环.
+ 930          //========================================================================
+ 931          void main()
+ 932          {
+ 933   1        Hw_IO_Init();
+ 934   1      
+ 935   1        Data_Init();
+ 936   1        AdcInit();
+ 937   1        UartInit();
+ 938   1        PWM_Init();
+ 939   1        Timer0_Init();
+ 940   1        EA = 1;
+ 941   1        UartSendStr(datt);
+ 942   1      
+ 943   1        while(1)
+ 944   1          Task_Pro_Handler_Callback();
+ 945   1      }
+ 946          
+ 947          //========================================================================
+ 948          // 函数: Task_Marks_Handler_Callback
+ 949          // 描述: 任务标记回调,在1ms定时中断中递减任务计数器.
+ 950          // 参数: None.
+ 951          // 返回: None.
+ 952          //========================================================================
+ 953          void Task_Marks_Handler_Callback(void)
+ 954          {
+ 955   1        unsigned char i;
+ 956   1        for(i = 0; i < Tasks_Max; i++)
+ 957   1        {
+ 958   2          if(Task_Comps[i].TIMCount)
+ 959   2          {
+ 960   3            Task_Comps[i].TIMCount--;
+ 961   3            if(Task_Comps[i].TIMCount == 0)
+ 962   3            {
+ 963   4              Task_Comps[i].TIMCount = Task_Comps[i].TRITime;
+ 964   4              Task_Comps[i].Run = 1;
+ 965   4            }
+ 966   3          }
+ 967   2        }
+ 968   1      }
+ 969          
+ 970          //========================================================================
+ 971          // 函数: Task_Pro_Handler_Callback
+ 972          // 描述: 任务处理回调,在主循环中执行已到时的任务.
+ 973          // 参数: None.
+ 974          // 返回: None.
+ 975          //========================================================================
+ 976          void Task_Pro_Handler_Callback(void)
+ 977          {
+ 978   1        unsigned char i;
+ 979   1        for(i = 0; i < Tasks_Max; i++)
+ 980   1        {
+ 981   2          if(Task_Comps[i].Run)
+ 982   2          {
+ 983   3            Task_Comps[i].Run = 0;
+ 984   3            Task_Comps[i].TaskHook();
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 17  
+
+ 985   3          }
+ 986   2        }
+ 987   1      }
+ 988          
+ 989          //========================================================================
+ 990          // 函数: Data_Init
+ 991          // 描述: 系统数据与按键状态初始化.
+ 992          // 参数: None.
+ 993          // 返回: None.
+ 994          //========================================================================
+ 995          void Data_Init(void)
+ 996          {
+ 997   1        Output_AllOff();
+ 998   1        Sys.Gear = GEAR_NONE;
+ 999   1        Sys.Strobe_Phase = 1;
+1000   1        Sys.Ver_Major = 1;
+1001   1        Sys.Ver_Minor = 0;
+1002   1        Sys.Bat_Alarm = 0;
+1003   1        Sys.MidHold_ms = 0;
+1004   1        KeyRed.stable = 1;                  //初始为松开状态
+1005   1        KeyGreen.stable = 1;
+1006   1        KeyWeak.stable = 1;
+1007   1        Key_Reset(&KeyRed);
+1008   1        Key_Reset(&KeyGreen);
+1009   1        Key_Reset(&KeyWeak);
+1010   1      }
+1011          
+1012          //========================================================================
+1013          // 函数: Timer0_Init
+1014          // 描述: 定时器0初始化,1ms中断@24MHz.
+1015          // 参数: None.
+1016          // 返回: None.
+1017          //========================================================================
+1018          void Timer0_Init(void)
+1019          {
+1020   1        AUXR |= 0x80;                       //定时器时钟1T模式
+1021   1        TMOD &= 0xF0;
+1022   1        TL0 = 0x40;
+1023   1        TH0 = 0xA2;
+1024   1        TF0 = 0;
+1025   1        TR0 = 1;
+1026   1        ET0 = 1;
+1027   1      }
+1028          
+1029          //========================================================================
+1030          // 函数: UartInit
+1031          // 描述: 串口1初始化,115200波特率,定时器1作波特率发生器.
+1032          // 参数: None.
+1033          // 返回: None.
+1034          //========================================================================
+1035          void UartInit()
+1036          {
+1037   1        SCON = 0x50;                        //8位数据,可变波特率
+1038   1        AUXR |= 0x40;                       //定时器时钟1T模式
+1039   1        AUXR &= 0xFE;                       //串口1选择定时器1
+1040   1        TMOD &= 0x0F;
+1041   1        TL1 = BRT;
+1042   1        TH1 = BRT >> 8;
+1043   1        ET1 = 0;
+1044   1        TR1 = 1;
+1045   1        ES = 1;
+1046   1      
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 18  
+
+1047   1        COM1.RX_Cnt = 0;
+1048   1        COM1.RX_TimeOut = 0;
+1049   1        COM1.busy = 0;
+1050   1      }
+1051          
+1052          //========================================================================
+1053          // 函数: AdcInit
+1054          // 描述: ADC模块初始化.
+1055          // 参数: None.
+1056          // 返回: None.
+1057          //========================================================================
+1058          void AdcInit()
+1059          {
+1060   1        P_SW2 |= 0x80;
+1061   1        ADCTIM = 0x3f;                      //ADC内部时序
+1062   1        P_SW2 &= 0x7f;
+1063   1        ADCCFG = 0x24;
+1064   1        ADC_CONTR |= 0x80;                  //使能ADC模块
+1065   1      }
+1066          
+1067          //========================================================================
+1068          // 函数: PWM_Init
+1069          // 描述: PWMA初始化,配置绿/红/白三路PWM.
+1070          //       CH1-CCR1-P13红光  CH2-CCR2-P11绿光  CH3-CCR3-P15白光
+1071          // 参数: None.
+1072          // 返回: None.
+1073          //========================================================================
+1074          void PWM_Init(void)
+1075          {
+1076   1        P_SW2 |= 0x80;
+1077   1        PWMA_CCER1 = 0x00;                  //写CCMR前须先关闭通道
+1078   1        PWMA_CCER2 = 0x00;
+1079   1      
+1080   1        PWMA_CCMR1 = 0x60;                  //CH1 PWMA输出 P13红光
+1081   1        PWMA_CCMR2 = 0x60;                  //CH2 PWMA输出 P11绿光
+1082   1        PWMA_CCMR3 = 0x60;                  //CH3 PWMA输出 P15白光
+1083   1      
+1084   1        PWMA_CCER1 = 0x44;                  //使能CH1 CH2
+1085   1        PWMA_CCER2 = 0x04;                  //使能CH3
+1086   1      
+1087   1        PWMA_PSCR = 240 - 1;
+1088   1        PWMA_ARR = PWM_ARR_MAX;
+1089   1        PWMA_CCR1 = 0;
+1090   1        PWMA_CCR2 = 0;
+1091   1        PWMA_CCR3 = 0;
+1092   1      
+1093   1        PWMA_ENO = 0x2A;                    //使能CH1~CH3端口输出
+1094   1        PWMA_BKR = 0x80;                    //使能主输出
+1095   1        PWMA_CR1 = 0x01;                    //开始计时
+1096   1        P_SW2 &= 0x7f;
+1097   1      }
+1098          
+1099          //========================================================================
+1100          // 函数: PWM_SetWhite / PWM_SetGreen / PWM_SetRed
+1101          // 描述: 设置各通道PWM占空比,0=关闭.
+1102          // 参数: duty - 占空比计数值(0~PWM_ARR_MAX).
+1103          // 返回: None.
+1104          //========================================================================
+1105          void PWM_SetWhite(unsigned char duty)
+1106          {
+1107   1        if(duty > PWM_ARR_MAX) duty = PWM_ARR_MAX;
+1108   1        P_SW2 |= 0x80;
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 19  
+
+1109   1        PWMA_CCR3 = duty;                   //CH3 白光 P15
+1110   1        P_SW2 &= 0x7f;
+1111   1      }
+1112          
+1113          void PWM_SetGreen(unsigned char duty)
+1114          {
+1115   1        if(duty > PWM_ARR_MAX) duty = PWM_ARR_MAX;
+1116   1        P_SW2 |= 0x80;
+1117   1        PWMA_CCR2 = duty;                   //CH2 绿光 P11
+1118   1        P_SW2 &= 0x7f;
+1119   1      }
+1120          
+1121          void PWM_SetRed(unsigned char duty)
+1122          {
+1123   1        if(duty > PWM_ARR_MAX) duty = PWM_ARR_MAX;
+1124   1        P_SW2 |= 0x80;
+1125   1        PWMA_CCR1 = duty;                   //CH1 红光 P13
+1126   1        P_SW2 &= 0x7f;
+1127   1      }
+1128          
+1129          //========================================================================
+1130          // 函数: PWM_AllOff
+1131          // 描述: 关闭所有PWM通道.
+1132          // 参数: None.
+1133          // 返回: None.
+1134          //========================================================================
+1135          void PWM_AllOff(void)
+1136          {
+1137   1        PWM_SetWhite(0);
+1138   1        PWM_SetGreen(0);
+1139   1        PWM_SetRed(0);
+1140   1      }
+1141          
+1142          //========================================================================
+1143          // 函数: putchar
+1144          // 描述: printf重定向到串口1.
+1145          //========================================================================
+1146          char putchar(char c)
+1147          {
+1148   1        UartSend(c);
+1149   1        return c;
+1150   1      }
+1151          
+1152          //========================================================================
+1153          // 函数: UartSend / UartSendStr
+1154          // 描述: 串口发送单字节/字符串.
+1155          //========================================================================
+1156          void UartSend(unsigned char dat)
+1157          {
+1158   1        while(COM1.busy);
+1159   1        COM1.busy = 1;
+1160   1        SBUF = dat;
+1161   1      }
+1162          
+1163          void UartSendStr(char *p)
+1164          {
+1165   1        while(*p)
+1166   1          UartSend(*p++);
+1167   1      }
+1168          
+1169          //========================================================================
+1170          // 函数: ADCRead
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 20  
+
+1171          // 描述: 查询法读取一次ADC转换结果.
+1172          // 参数: ChX - ADC通道号(0~15).
+1173          // 返回: ADC结果,失败返回4096.
+1174          //========================================================================
+1175          unsigned int ADCRead(unsigned char ChX)
+1176          {
+1177   1        unsigned int res;
+1178   1        unsigned char i;
+1179   1      
+1180   1        if(ChX > 15) return 4096;
+1181   1        ADC_RES = 0;
+1182   1        ADC_RESL = 0;
+1183   1        ADC_CONTR = (ADC_CONTR & 0xf0) | 0x40 | ChX;
+1184   1        _nop_();
+1185   1        _nop_();
+1186   1      
+1187   1        for(i = 0; i < 250; i++)
+1188   1        {
+1189   2          if(ADC_CONTR & 0x20)
+1190   2          {
+1191   3            ADC_CONTR &= ~0x20;
+1192   3            res = ((unsigned int)ADC_RES << 8) | ADC_RESL;
+1193   3            return res;
+1194   3          }
+1195   2        }
+1196   1        return 4096;
+1197   1      }
+1198          
+1199          //========================================================================
+1200          // 函数: Hw_IO_Init
+1201          // 描述: 硬件IO口初始化(上电/唤醒复位后调用).
+1202          // 参数: None.
+1203          // 返回: None.
+1204          //========================================================================
+1205          void Hw_IO_Init(void)
+1206          {
+1207   1        P1M0 = 0xea; P1M1 = 0x15;          //P10高阻 P11/P13/P15/P16/P17推挽
+1208   1        P3M0 = 0x00; P3M1 = 0x00;          //P3全部准双向(按键+串口)
+1209   1        P0M0 = 0x00; P0M1 = 0xff;          //P0全部高阻
+1210   1        P2M0 = 0x00; P2M1 = 0xff;          //P2全部高阻
+1211   1        P4M0 = 0x00; P4M1 = 0xff;          //P4全部高阻
+1212   1        P5M0 = 0x00; P5M1 = 0xff;          //P5全部高阻
+1213   1      
+1214   1        LD_EN = 1;                          //默认关闭激光(高电平关)
+1215   1        V5_EN = 0;
+1216   1      }
+1217          
+1218          //========================================================================
+1219          // 函数: ShutDown
+1220          // 描述: 关机休眠.串口通知后IO高阻, P32唤醒后软复位开机.
+1221          // 参数: None.
+1222          // 返回: None.
+1223          //========================================================================
+1224          void ShutDown(void)
+1225          {
+1226   1        Output_AllOff();
+1227   1        Output_Apply();
+1228   1      
+1229   1        printf("Shutdown\r\n");
+1230   1        while(COM1.busy);                   //等待串口发送完成
+1231   1      
+1232   1        ET0 = 0;
+C51 COMPILER V9.60.0.0   MAIN                                                              07/18/2026 18:21:10 PAGE 21  
+
+1233   1        ES = 0;
+1234   1        EX0 = 0;
+1235   1        EA = 0;
+1236   1        PWM_AllOff();
+1237   1      
+1238   1        P1M0 = 0x00; P1M1 = 0xff;          //全部高阻输入
+1239   1        P0M0 = 0x00; P0M1 = 0xff;
+1240   1        P2M0 = 0x00; P2M1 = 0xff;
+1241   1        P3M0 = 0x00; P3M1 = 0xff;
+1242   1        P4M0 = 0x00; P4M1 = 0xff;
+1243   1        P5M0 = 0x00; P5M1 = 0xff;
+1244   1      
+1245   1        P3M1 &= ~0x04;                      //P32保持准双向, 避免高阻浮空误触发INT0
+1246   1        IT0 = 0;                            //INT0上升沿+下降沿中断
+1247   1        IE0 = 0;                            //清除挂起标志, 防止进休眠立即唤醒
+1248   1        EX0 = 1;
+1249   1        EA = 1;
+1250   1      
+1251   1        PCON = 0x02;                        //MCU进入掉电模式
+1252   1        _nop_();                            //唤醒后先执行此处,再进INT0中断
+1253   1        _nop_();
+1254   1        _nop_();
+1255   1        _nop_();
+1256   1      
+1257   1        /* 未触发软复位时的兜底恢复 */
+1258   1        Hw_IO_Init();
+1259   1        Timer0_Init();
+1260   1        ES = 1;
+1261   1        Sys.MidHold_ms = 0;
+1262   1      }
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   5110    ----
+   CONSTANT SIZE    =    121    ----
+   XDATA SIZE       =    249      61
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =   ----    ----
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)
